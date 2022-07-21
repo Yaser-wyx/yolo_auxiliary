@@ -89,7 +89,7 @@ class Detect(nn.Module):
 
 class Model(nn.Module):
     def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None,
-                 is_auxiliary=False, with_mixstyle=False, P=0.65,
+                 is_auxiliary=False, superposition=None, P=0.65,
                  net_layers=-1):  # model, input channels, number of classes
         super().__init__()
         if isinstance(cfg, dict):
@@ -101,10 +101,10 @@ class Model(nn.Module):
                 self.yaml = yaml.safe_load(f)  # model dict
 
         self.with_auxiliary = False
-        self.with_mixstyle = False
+        self.superposition = None
         self.feature_lambda = 0
 
-        self.auxiliary_start = 0
+        self.superposition_start = 0
         self.random_layers = 0  # 随机应用几层
         self.p = P  # mixstyle起作用的概率
         self.is_auxiliary = False
@@ -121,6 +121,7 @@ class Model(nn.Module):
             self.yaml['anchors'] = round(anchors)  # override yaml value
         self.model, self.save, layers_save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
         self.layers_save = layers_save if is_auxiliary else None
+        self.max_layer = max(layers_save)
         self.net_layers = len(self.model) if net_layers == -1 else net_layers  # 能够应用辅助网络与mixstyle的前x层
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         self.inplace = self.yaml.get('inplace', True)
@@ -142,31 +143,32 @@ class Model(nn.Module):
         self.info()
         LOGGER.info('')
         self.is_auxiliary = is_auxiliary
-        self.with_mixstyle = with_mixstyle
+        self.superposition = superposition
 
-    def apply_auxiliary(self, random_layers, feature_lambda, auxiliary_start, progressive, epochs,with_auxiliary=True):
+    def set_exp_parameter(self, random_layers, feature_lambda, superposition_start, progressive, epochs,
+                          with_auxiliary=True):
         # 设置辅助网络以及训练策略
         self.with_auxiliary = with_auxiliary
         self.progressive = progressive
         self.random_layers = random_layers
         self.feature_lambda = feature_lambda
-        self.auxiliary_start = auxiliary_start
+        self.superposition_start = superposition_start
 
         if progressive:
-            assert epochs > auxiliary_start, "Error, auxiliary start later than total epochs"
-            self._generate_progressive_strategy(auxiliary_start, epochs)
+            assert epochs > superposition_start, "Error, auxiliary start later than total epochs"
+            self._generate_progressive_strategy(superposition_start, epochs)
 
-    def _generate_progressive_strategy(self, auxiliary_start, epochs):
+    def _generate_progressive_strategy(self, superposition_start, epochs):
         random_layer_list = [i for i in range(1, self.random_layers + 1, 1)]
         feature_lambda_list = [round(i, 2) for i in np.arange(0.05, self.feature_lambda + 0.001, 0.05)]
-        assert epochs > auxiliary_start + max(len(random_layer_list), len(feature_lambda_list))
+        assert epochs > superposition_start + max(len(random_layer_list), len(feature_lambda_list))
 
         self.progressive_strategy_map = {
             "random_layers": {
-                auxiliary_start + i: v for i, v in enumerate(random_layer_list)
+                superposition_start + i: v for i, v in enumerate(random_layer_list)
             },
             "feature_lambda": {
-                auxiliary_start + i: v for i, v in enumerate(feature_lambda_list)
+                superposition_start + i: v for i, v in enumerate(feature_lambda_list)
             },
         }
         LOGGER.info(f"progressive_strategy: {self.progressive_strategy_map}")
@@ -174,7 +176,7 @@ class Model(nn.Module):
     def forward(self, x, augment=False, profile=False, visualize=False, epoch=0, auxiliary_output=None):
         if augment:
             return self._forward_augment(x)  # augmented inference, None
-        if self.is_auxiliary:
+        if hasattr(self, "is_auxiliary") and self.is_auxiliary:
             # 如果是辅助网络
             return self._forward_once_auxiliary(x, profile, visualize)
         else:
@@ -195,20 +197,37 @@ class Model(nn.Module):
         y = self._clip_augmented(y)  # clip augmented tails
         return torch.cat(y, 1), None  # augmented inference, train
 
+    @staticmethod
+    def apply_direct(another_output, x, _lambda):
+        # 使用特征直接叠加的方式
+        x = _lambda * another_output + (1 - _lambda) * x
+        return x
+
+    @staticmethod
+    def apply_mixstyle(another_output, x, _lambda):
+        # 使用mixstyle的特征叠加方式
+        mu = torch.mean(x, dim=(2, 3), keepdim=True).detach().to(x.device)
+        var = torch.var(x, dim=(2, 3), keepdim=True).detach()
+        sig = torch.sqrt(var + 1e-6).detach().to(x.device)
+        x_normed = (x - mu) / sig  # normalize the x
+        # calculate the mean and std of the auxiliary_output
+        another_mu = torch.mean(another_output, dim=(2, 3), keepdim=True).detach().to(x.device)
+        another_var = torch.var(another_output, dim=(2, 3), keepdim=True).detach()
+        another_sig = torch.sqrt(another_var + 1e-6).detach().to(x.device)
+        mu_mix = (1 - _lambda) * another_mu + _lambda * mu  # calculate the mean of the mix
+        sig_mix = (1 - _lambda) * another_sig + _lambda * sig  # calculate the std of the mix
+        x = (x_normed * sig_mix) + mu_mix  # mix the x and auxiliary_output
+        return x
+
     def _forward_once(self, x, profile=False, visualize=False, epoch=0, auxiliary_output=None):
-
-        auxiliary_flag = self.training and \
-                         self.with_auxiliary and \
-                         auxiliary_output is not None and \
-                         epoch >= self.auxiliary_start
-
+        # 先将输入给辅助网络跑一遍，得到结果
         if self.progressive:
             # 更新参数
             random_layers_map = self.progressive_strategy_map["random_layers"]
             feature_lambda_map = self.progressive_strategy_map["feature_lambda"]
             self.random_layers = random_layers_map.get(epoch, self.random_layers)
             self.feature_lambda = feature_lambda_map.get(epoch, self.feature_lambda)
-        # 选择要进行随机叠加的层索引
+            # 选择要进行随机叠加的层索引
         random_select = np.random.choice(range(self.net_layers), self.random_layers, replace=False)
 
         y, dt = [], []  # outputs
@@ -218,35 +237,53 @@ class Model(nn.Module):
             if profile:
                 self._profile_one_layer(m, x, dt)
             x = m(x)  # run
+            satisfy_flag = self.superposition is not None \
+                           and random.random() > self.p \
+                           and m.i in random_select \
+                           and epoch >= self.superposition_start \
+                           and self.training
+            before_auxiliary = x.clone() if satisfy_flag else None
 
-            if self.with_mixstyle and random.random() > self.p and m.i in random_select:
+            if satisfy_flag:
+                # 如果满足进使用特征图叠加的条件
+                auxiliary_flag = self.with_auxiliary and \
+                                 auxiliary_output is not None
+
                 if auxiliary_flag:
+                    # 如果使用辅助网络
                     assert m.i in auxiliary_output.keys()
                     another_output = auxiliary_output[m.i]
                 else:
-                    another_output = x
+                    # 否则就直接使用自身进行叠加
+                    another_output = x.clone()
+
+                # shuffle the batch
                 shuffle_idx = torch.randperm(another_output.size(0))
                 another_output = another_output[shuffle_idx]
                 feature_lambda = self.feature_lambda / self.random_layers
                 _lambda = torch.distributions.Beta(feature_lambda, feature_lambda).sample((x.shape[0], 1, 1, 1)).to(
                     x.device)
-                # calculate the mean and std of the x
-                mu = torch.mean(x, dim=(2, 3), keepdim=True).detach().to(x.device)
-                var = torch.var(x, dim=(2, 3), keepdim=True).detach()
-                sig = torch.sqrt(var + 1e-6).detach().to(x.device)
-                x_normed = (x - mu) / sig  # normalize the x
-                # calculate the mean and std of the auxiliary_output
-                another_mu = torch.mean(another_output, dim=(2, 3), keepdim=True).detach().to(x.device)
-                another_var = torch.var(another_output, dim=(2, 3), keepdim=True).detach()
-                another_sig = torch.sqrt(another_var + 1e-6).detach().to(x.device)
-                mu_mix = (1 - _lambda) * another_mu + _lambda * mu  # calculate the mean of the mix
-                sig_mix = (1 - _lambda) * another_sig + _lambda * sig  # calculate the std of the mix
-                x = (x_normed * sig_mix) + mu_mix  # mix the x and auxiliary_output
+
+                if self.superposition == "MixStyle":
+                    x = self.apply_mixstyle(another_output, x, _lambda)
+                elif self.superposition == "Direct":
+                    x = self.apply_direct(another_output, x, _lambda)
 
             y.append(x if m.i in self.save else None)  # save output
-
-            if visualize:
-                feature_visualization(x, m.type, m.i, save_dir=visualize)
+            if self.training:
+                if visualize and satisfy_flag:
+                    # 可视化显示应用叠加的特征图
+                    differ = x - before_auxiliary
+                    feature_visualization(differ.cpu().detach(), m.type, m.i, save_dir=Path("run/feature_show"),
+                                          name=f"epoch_{epoch}_differ")
+                    feature_visualization(before_auxiliary.cpu().detach(), m.type, m.i,
+                                          save_dir=Path("run/feature_show"),
+                                          name=f"epoch_{epoch}_before")
+                    feature_visualization(x.cpu().detach(), m.type, m.i, save_dir=Path("run/feature_show"),
+                                          name=f"epoch_{epoch}_after")
+            else:
+                if visualize:
+                    feature_visualization(x, m.type, m.i, save_dir=visualize)
 
         return x
 
@@ -259,7 +296,7 @@ class Model(nn.Module):
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             x = m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
-            # 当前是辅助网络，则记录backbone的每一层输出
+            # 当前是辅助网络，保存需要的输出
             if m.i in self.layers_save:
                 layers_output[m.i] = x
 
@@ -322,11 +359,6 @@ class Model(nn.Module):
             b = mi.bias.detach().view(m.na, -1).T  # conv.bias(255) to (3,85)
             LOGGER.info(
                 ('%6g Conv2d.bias:' + '%10.3g' * 6) % (mi.weight.shape[1], *b[:5].mean(1).tolist(), b[5:].mean()))
-
-    # def _print_weights(self):
-    #     for m in self.model.modules():
-    #         if type(m) is Bottleneck:
-    #             LOGGER.info('%10.3g' % (m.w.detach().sigmoid() * 2))  # shortcut weights
 
     def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
         LOGGER.info('Fusing layers... ')
@@ -411,6 +443,37 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             ch = []
         ch.append(c2)
     return nn.Sequential(*layers), sorted(save), added_layers
+
+
+RANDOM_INIT_FUNC_MAP = {
+    0: init.normal_,
+    1: init.xavier_normal_,  # >=2
+    2: init.kaiming_normal_,  # >=2
+    3: init.orthogonal_,  # >=2
+
+    # 2: init.xavier_uniform_,  # >=2
+    # 3: init.xavier_normal_,  # >=2
+    # 4: init.kaiming_uniform_,  # >=2
+    # 5: init.orthogonal_,  # >=2
+    # 6: init.kaiming_normal_,  # >=2
+
+}
+
+
+def random_apply(data):
+    dim = data.dim()
+    if dim < 2:
+        random_value = 0
+    else:
+        random_value = random.randint(0, 3)
+
+    init_func = RANDOM_INIT_FUNC_MAP[random_value]
+    init_func(data)
+
+
+def random_weights_init(m):
+    if type(m) in {nn.Conv2d, nn.Linear}:
+        random_apply(m.weight.data)
 
 
 def init_weights(m):

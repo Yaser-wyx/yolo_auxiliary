@@ -15,6 +15,10 @@ Usage:
 import argparse
 import math
 import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "3,4"
+
 import random
 import sys
 import time
@@ -41,7 +45,7 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 import val  # for end-of-epoch mAP
 from models.experimental import attempt_load
-from models.yolo import Model
+from models.yolo import Model, init_weights, random_weights_init
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
@@ -59,8 +63,6 @@ from utils.metrics import fitness
 from utils.plots import plot_evolve, plot_labels
 from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_device, torch_distributed_zero_first
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,1,0"
-
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
@@ -77,10 +79,13 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
           opt.resume, opt.noval, opt.nosave, opt.workers, \
           opt.freeze, opt.limit_data
 
-    feature_lambda, auxiliary_start, with_auxiliary, random_layers, progressive, net_layers, with_mixstyle = \
-        opt.lambda_, opt.auxiliary_start, opt.with_auxiliary, opt.random_layers, opt.progressive, \
-        opt.net_layers, opt.with_mixstyle
-
+    feature_lambda, superposition_start, auxiliary_type, random_layers, progressive, net_layers, superposition = \
+        opt.lambda_, opt.superposition_start, opt.auxiliary_type, opt.random_layers, opt.progressive, \
+        opt.net_layers, opt.superposition
+    visualize = opt.visualize
+    superposition = None if superposition == "None" else superposition
+    auxiliary_type = None if auxiliary_type == "None" else auxiliary_type
+    with_auxiliary = auxiliary_type is not None
     # Directories
     w = save_dir / 'weights'  # weights dir
     (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
@@ -132,8 +137,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
         model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors'),
-                      with_mixstyle=with_mixstyle, net_layers=net_layers).to(device)  # create
-        # auxiliary random init network
+                      superposition=superposition, net_layers=net_layers).to(device)  # create
+        # auxiliary network init
         auxiliary_model_cfg = cfg or ckpt['model'].yaml if with_auxiliary else None
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
         csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
@@ -141,7 +146,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         model.load_state_dict(csd, strict=False)  # load
         LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
     else:
-        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), with_mixstyle=with_mixstyle,
+        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), superposition=superposition,
                       net_layers=net_layers).to(device)  # create
         # auxiliary random init network
         auxiliary_model_cfg = cfg if with_auxiliary else None
@@ -223,7 +228,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             epochs += ckpt['epoch']  # finetune additional epochs
 
         del ckpt, csd
-    # 添加辅助网络
+    # add auxiliary net
     auxiliary_model = None
     if with_auxiliary:
         random_layers = max(random_layers, 1)
@@ -235,8 +240,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             auxiliary_model.layers_save = auxiliary_model.layers_save[:net_layers]
         random_layers = min(random_layers,
                             len(auxiliary_model.layers_save))  # limit random layers smaller than net_layers
-    model.apply_auxiliary(random_layers, feature_lambda, auxiliary_start, progressive, epochs,
-                          with_auxiliary=with_auxiliary)
+    model.set_exp_parameter(random_layers, feature_lambda, superposition_start, progressive, epochs,
+                            with_auxiliary=with_auxiliary)  # set exp parameter
 
     # DP mode
     if cuda and RANK == -1 and torch.cuda.device_count() > 1:
@@ -314,11 +319,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
-        if with_auxiliary:
-            pre_epoch_state_dict = deepcopy(de_parallel(model.state_dict()))  # save current state_dict
-            if epoch >= auxiliary_start :
+        if with_auxiliary and epoch >= superposition_start:
+            if auxiliary_type == "Last":
+                pre_epoch_state_dict = deepcopy(de_parallel(model.state_dict()))  # save current state_dict
                 auxiliary_model.load_state_dict(pre_epoch_state_dict, strict=False)
-
+            # elif auxiliary_type == "Random":
+            #     auxiliary_model.apply(random_weights_init)
         # Update image weights (optional, single-GPU only)
         if opt.image_weights:
             cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
@@ -363,9 +369,11 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
             # Forward
             with amp.autocast(enabled=cuda):
-                if with_auxiliary and epoch >= auxiliary_start:
+                if with_auxiliary and epoch >= superposition_start:
+                    if auxiliary_type == "Random" and i % 50 == 0:
+                        auxiliary_model.apply(random_weights_init)
                     auxiliary_output = auxiliary_model(imgs)
-                    pred = model(imgs, epoch=epoch, auxiliary_output=auxiliary_output)  # forward
+                    pred = model(imgs, visualize=visualize, epoch=epoch, auxiliary_output=auxiliary_output)  # forward
                 else:
                     pred = model(imgs)
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
@@ -493,17 +501,21 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default=ROOT / 'yolov5s.pt', help='initial weights path')
-
-    parser.add_argument('--with-auxiliary', action='store_true', help='use auxiliary model to help training')
+    # the type of auxiliary network, they are random init, the last epoch and don't use it
+    parser.add_argument('--auxiliary-type', type=str, choices=['Random', 'Last', 'None'], default='Last',
+                        help='use auxiliary model to help training')
     parser.add_argument('--progressive', action='store_true',
                         help='use linear progressive strategy to train model with auxiliary net')
-    parser.add_argument('--random-layers', type=int, default=2)
+    parser.add_argument('--random-layers', type=int, default=1)
+    # 如果使用mixstyle叠加方式，则该值代表保留原始图像风格信息的比例，否则就是代表叠加图像所占的比例
     parser.add_argument('--lambda_', type=float, default=0.1)
-    parser.add_argument('--with-mixstyle', action='store_true',
-                        help='whether use MixStyle, it can use together with auxiliary net.')
+    parser.add_argument('--superposition', type=str, choices=['MixStyle', 'Direct', 'None'], default='MixStyle',
+                        help='the way of superposition for the auxiliary network')
 
     parser.add_argument('--net-layers', type=int, default=-1)
-    parser.add_argument('--auxiliary-start', type=int, default=5)
+    parser.add_argument('--superposition-start', type=int, default=5)
+    parser.add_argument('--visualize', action='store_true', help='visualize features')
+
     parser.add_argument('--limit-data', type=int, default=-1, help='limit data to this number')
 
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
@@ -526,7 +538,7 @@ def parse_opt(known=False):
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
     parser.add_argument('--optimizer', type=str, choices=['SGD', 'Adam', 'AdamW'], default='SGD', help='optimizer')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
-    parser.add_argument('--workers', type=int, default=12, help='max dataloader workers (per RANK in DDP mode)')
+    parser.add_argument('--workers', type=int, default=20, help='max dataloader workers (per RANK in DDP mode)')
     parser.add_argument('--project', default=ROOT / 'runs/train', help='save to project/name')
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')

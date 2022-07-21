@@ -9,7 +9,8 @@
 @Describe: 
 """
 import os.path
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,0,3,2"
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5"
 
 from utils.common_utils import *
 
@@ -20,8 +21,8 @@ DATASET_MAP = {
 }
 
 DATASET_CAR_MAP = {
-    "Cityscape_raw_car": "/data/yaser/data/research/CityscapeDataset_car/rawDataset/data.yaml",
     "Cityscape_rain_car": "/data/yaser/data/research/CityscapeDataset_car/rainDataset/data.yaml",
+    "Cityscape_raw_car": "/data/yaser/data/research/CityscapeDataset_car/rawDataset/data.yaml",
     "Cityscape_foggy_car": "/data/yaser/data/research/CityscapeDataset_car/foggyDataset/data.yaml",
     "SIM_10K_car": "/data/yaser/data/research/SIM_10K_Dataset/data.yaml",
 
@@ -56,14 +57,13 @@ def test_one(dir_path, val_name, dataset_map=None):
     if dataset_map is None:
         dataset_map = DATASET_MAP
     proj_name = dir_path.split("/")[-1]
-    weight_path = connect_path(dir_path, "weights", "last.pt")
+    weight_path = connect_path(dir_path, "weights", "best.pt")
     if exist(weight_path):
         for dataset_name, dataset_path in dataset_map.items():
             val_script(proj_name, weight_path, dataset_path, dataset_name, val_name=val_name)
 
 
 if __name__ == '__main__':
-    exp_path = "/data/yaser/project/yolo_random/runs/V5_5_with_MixStyle_0615/SIM_10K_Dataset"
-    # test_one(exp_path, val_name="V5_5_with_MixStyle_0615", dataset_map=DATASET_CAR_MAP)
-    test_dir(exp_path, val_name="V5_5_with_MixStyle_0620", dataset_map=DATASET_CAR_MAP)
-
+    exp_path = "/data/yaser/project/yolo_auxiliary/runs/debug/SIM_10K_Dataset/@R_1@Lay_2@Lmd_0.1@aux_Random@sup_MixStyle2"
+    test_one(exp_path, val_name="debug", dataset_map=DATASET_CAR_MAP)
+    # test_dir(exp_path, val_name="test", dataset_map=DATASET_CAR_MAP)
