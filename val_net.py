@@ -64,6 +64,6 @@ def test_one(dir_path, val_name, dataset_map=None):
 
 
 if __name__ == '__main__':
-    exp_path = "/data/yaser/project/yolo_auxiliary/runs/debug/SIM_10K_Dataset/@R_1@Lay_2@Lmd_0.1@aux_Random@sup_MixStyle2"
-    test_one(exp_path, val_name="debug", dataset_map=DATASET_CAR_MAP)
+    exp_path = "/data/yaser/project/yolo_auxiliary/runs/2022_7_21/SIM_10K_Dataset/@R_2@Lay_2@Lmd_0.1@aux_Random@sup_MixStyle"
+    test_one(exp_path, val_name="2022_7_22", dataset_map=DATASET_CAR_MAP)
     # test_dir(exp_path, val_name="test", dataset_map=DATASET_CAR_MAP)

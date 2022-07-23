@@ -12,6 +12,7 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from utils.common_utils import info
@@ -443,37 +444,6 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             ch = []
         ch.append(c2)
     return nn.Sequential(*layers), sorted(save), added_layers
-
-
-RANDOM_INIT_FUNC_MAP = {
-    0: init.normal_,
-    1: init.xavier_normal_,  # >=2
-    2: init.kaiming_normal_,  # >=2
-    3: init.orthogonal_,  # >=2
-
-    # 2: init.xavier_uniform_,  # >=2
-    # 3: init.xavier_normal_,  # >=2
-    # 4: init.kaiming_uniform_,  # >=2
-    # 5: init.orthogonal_,  # >=2
-    # 6: init.kaiming_normal_,  # >=2
-
-}
-
-
-def random_apply(data):
-    dim = data.dim()
-    if dim < 2:
-        random_value = 0
-    else:
-        random_value = random.randint(0, 3)
-
-    init_func = RANDOM_INIT_FUNC_MAP[random_value]
-    init_func(data)
-
-
-def random_weights_init(m):
-    if type(m) in {nn.Conv2d, nn.Linear}:
-        random_apply(m.weight.data)
 
 
 def init_weights(m):

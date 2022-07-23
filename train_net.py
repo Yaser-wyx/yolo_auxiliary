@@ -11,9 +11,9 @@
 
 from utils.common_utils import *
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,4,5,3"
 
-version = "2022_7_21"
+version = "random_auxiliary_init_exp"
 DEFAULT_CFG = {
     "random_layers": 1,
     "lambda_": 0.2,
@@ -41,7 +41,9 @@ def ablation_exp(parameter_name, parameters, **kwargs):
 
 def train_script(random_layers=0, lambda_=0, superposition_start=149, auxiliary_type="Last", progressive=False,
                  dataset="SIM_10K_Dataset", weights="yolov5n.pt", batch_size=44, epochs=150,
-                 net_layers=-1, superposition="MixStyle", limit=-1, cache=True, visualize=False, device=None):
+                 net_layers=-1, superposition="MixStyle", limit=-1, cache=True, visualize=False, device=None,
+                 address="127.0.1.1", auxiliary_initial_way='per-layer', init_before_batches=50,
+                 initial_distribution_num=1, init_distribution_fixed=False,master_port=48200):
     if device is None:
         device = [0, 1]
     device = list(map(str, device))
@@ -49,12 +51,19 @@ def train_script(random_layers=0, lambda_=0, superposition_start=149, auxiliary_
     log_dir = f"log/{version}"
     create_not_exist(log_dir)
     if auxiliary_type != "None" and superposition != "None":
-        proj_name = f"@R_{random_layers}@Lay_{net_layers}@Lmd_{lambda_}@aux_{auxiliary_type}@sup_{superposition}"
-    elif superposition != "None":
-        proj_name = f"NoAux_{dataset_name}_@R_{random_layers}@Lay_{net_layers}@Lmd_{lambda_}@sup_{superposition}"
+        proj_name = f"@init_way:{auxiliary_initial_way}@num:{initial_distribution_num}{'@fixed' if init_distribution_fixed else ''}"
     else:
         proj_name = f"Default_{dataset_name}"
-    cmd = f"nohup python  -m torch.distributed.launch  --nproc_per_node {len(device)} --master_addr 127.0.1.1  --master_port 47200 train.py --auxiliary-type {auxiliary_type} --superposition {superposition} --net-layers {net_layers}  {'--progressive' if progressive else ''} --data /data/yaser/data/research/{dataset}/data.yaml  --random-layers {random_layers} {'--cache' if cache else ''} {'--visualize' if visualize else ''}  --lambda_ {lambda_} --superposition-start {superposition_start}  --hyp  hyp.VOC.yaml  --weights {weights} --batch-size {batch_size}   --label-smoothing 0.15 --img-size 960 --limit-data {limit}  --device {','.join(device)} --project runs/{version}/{dataset_name} --name {proj_name} --epochs {epochs} >> {log_dir}/{proj_name}.log"
+    cmd = f"nohup python  -m torch.distributed.launch  --nproc_per_node {len(device)} --master_addr {address}  --master_port {master_port} train.py" \
+          f" --auxiliary-type {auxiliary_type} --superposition {superposition} --net-layers {net_layers}  {'--progressive' if progressive else ''}" \
+          f" --data /data/yaser/data/research/{dataset}/data.yaml  --random-layers {random_layers} {'--cache' if cache else ''} " \
+          f"{'--visualize' if visualize else ''}  --lambda_ {lambda_} --superposition-start {superposition_start} " \
+          f"--initial-distribution-num {initial_distribution_num} --init-before-batches {init_before_batches} " \
+          f"--random-auxiliary-initial-way {auxiliary_initial_way} {'--init-distribution-fixed' if init_distribution_fixed else ''}" \
+          f" --hyp  hyp.VOC.yaml  --weights {weights} --batch-size {batch_size} " \
+          f"  --label-smoothing 0.15 --img-size 960 --limit-data {limit} " \
+          f" --device {','.join(device)} --project runs/{version}/{dataset_name} " \
+          f"--name {proj_name} --epochs {epochs} >> {log_dir}/{proj_name}.log"
 
     debug(cmd)
     os.system(cmd)
@@ -71,10 +80,15 @@ if __name__ == '__main__':
         "superposition_start": 5,
         "progressive": True,
         "net_layers": 2,
-        "batch_size": 44,
-        "device": [0, 1]
+        "device": [4, 5],
+        "auxiliary_type": "Random",
+        "superposition": "MixStyle",
+        "master_port": 48500,
+        "address":"127.0.1.2"
     }
 
-    for auxiliary_type in ["Random"]:
-        for superposition in ['MixStyle']:
-            train_script(auxiliary_type=auxiliary_type, superposition=superposition, **base_config)
+    for auxiliary_initial_way in ['per-layer', 'whole-net']:
+            for initial_distribution_num in [3, 5, 7]:
+                train_script(auxiliary_initial_way=auxiliary_initial_way,
+                             initial_distribution_num=initial_distribution_num,
+                             init_distribution_fixed=True, **base_config)

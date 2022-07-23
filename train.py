@@ -16,7 +16,9 @@ import argparse
 import math
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5"
+from models.random_auxiliary_init import RandomAuxiliaryInit, set_random_auxiliary_init
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,4,5,3"
 # os.environ["CUDA_VISIBLE_DEVICES"] = "3,4"
 
 import random
@@ -45,7 +47,7 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 import val  # for end-of-epoch mAP
 from models.experimental import attempt_load
-from models.yolo import Model, init_weights, random_weights_init
+from models.yolo import Model, init_weights
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
@@ -82,6 +84,14 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     feature_lambda, superposition_start, auxiliary_type, random_layers, progressive, net_layers, superposition = \
         opt.lambda_, opt.superposition_start, opt.auxiliary_type, opt.random_layers, opt.progressive, \
         opt.net_layers, opt.superposition
+
+    initial_distribution_num, init_before_batches, random_auxiliary_initial_way, init_distribution_fixed = opt.initial_distribution_num, opt.init_before_batches, opt.random_auxiliary_initial_way, opt.init_distribution_fixed
+    # for random_auxiliary net init
+    if auxiliary_type == "Random":
+        random_auxiliary_init: RandomAuxiliaryInit = set_random_auxiliary_init(initial_distribution_num,
+                                                                               random_auxiliary_initial_way,
+                                                                               init_distribution_fixed)
+
     visualize = opt.visualize
     superposition = None if superposition == "None" else superposition
     auxiliary_type = None if auxiliary_type == "None" else auxiliary_type
@@ -319,12 +329,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
+
         if with_auxiliary and epoch >= superposition_start:
             if auxiliary_type == "Last":
                 pre_epoch_state_dict = deepcopy(de_parallel(model.state_dict()))  # save current state_dict
                 auxiliary_model.load_state_dict(pre_epoch_state_dict, strict=False)
-            # elif auxiliary_type == "Random":
-            #     auxiliary_model.apply(random_weights_init)
+
         # Update image weights (optional, single-GPU only)
         if opt.image_weights:
             cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
@@ -370,8 +380,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # Forward
             with amp.autocast(enabled=cuda):
                 if with_auxiliary and epoch >= superposition_start:
-                    if auxiliary_type == "Random" and i % 50 == 0:
-                        auxiliary_model.apply(random_weights_init)
+                    if auxiliary_type == "Random" and i % init_before_batches == 0:
+                        random_auxiliary_init.apply_random_init(auxiliary_model)
                     auxiliary_output = auxiliary_model(imgs)
                     pred = model(imgs, visualize=visualize, epoch=epoch, auxiliary_output=auxiliary_output)  # forward
                 else:
@@ -455,7 +465,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # Stop Single-GPU
             if RANK == -1 and stopper(epoch=epoch, fitness=fi):
                 break
-
+            if results[0] == 0 and results[1] == 0 and results[2] == 0:
+                # error occur
+                break
             # Stop DDP TODO: known issues shttps://github.com/ultralytics/yolov5/pull/4576
             # stop = stopper(epoch=epoch, fitness=fi)
             # if RANK == 0:
@@ -509,8 +521,21 @@ def parse_opt(known=False):
     parser.add_argument('--random-layers', type=int, default=1)
     # 如果使用mixstyle叠加方式，则该值代表保留原始图像风格信息的比例，否则就是代表叠加图像所占的比例
     parser.add_argument('--lambda_', type=float, default=0.1)
+
     parser.add_argument('--superposition', type=str, choices=['MixStyle', 'Direct', 'None'], default='MixStyle',
                         help='the way of superposition for the auxiliary network')
+
+    parser.add_argument('--initial-distribution-num', type=int, default=1,
+                        help='the number of init distribution for random auxiliary network to init')
+
+    parser.add_argument('--init-before-batches', type=int, default=50,
+                        help='how many batches before random auxiliary network to re-init')
+
+    parser.add_argument('--random-auxiliary-initial-way', type=str, choices=['whole-net', 'per-layer'],
+                        default='per-layer',
+                        help='the initial way of random-auxiliary')
+
+    parser.add_argument('--init-distribution-fixed', action='store_true', help='fixed the initial distribution')
 
     parser.add_argument('--net-layers', type=int, default=-1)
     parser.add_argument('--superposition-start', type=int, default=5)
